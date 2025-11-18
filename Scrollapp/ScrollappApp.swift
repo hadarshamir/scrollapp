@@ -39,20 +39,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var launchAtLogin = false        // Track launch at login state
     var scrollSensitivity: Double = 1.0  // Default sensitivity multiplier
     var activationMethod: ActivationMethod = .middleClick  // Default activation method
-    var hideFromMenuBar = false      // Track menu bar visibility
     
     enum ActivationMethod: String, CaseIterable {
         case middleClick = "Middle Click"
+        case middleClickHold = "Middle Click (Hold)"
         case shiftMiddleClick = "Shift + Middle Click"
         case cmdMiddleClick = "Cmd + Middle Click"
         case optionMiddleClick = "Option + Middle Click"
         case button4 = "Mouse Button 4"
         case button5 = "Mouse Button 5"
         case doubleMiddleClick = "Double Middle Click"
-        
+
         var buttonNumber: Int? {
             switch self {
-            case .middleClick, .shiftMiddleClick, .cmdMiddleClick, .optionMiddleClick, .doubleMiddleClick:
+            case .middleClick, .middleClickHold, .shiftMiddleClick, .cmdMiddleClick, .optionMiddleClick, .doubleMiddleClick:
                 return 2
             case .button4:
                 return 3
@@ -60,7 +60,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 return 4
             }
         }
-        
+
         var requiresModifier: Bool {
             switch self {
             case .shiftMiddleClick, .cmdMiddleClick, .optionMiddleClick:
@@ -69,7 +69,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 return false
             }
         }
-        
+
         var modifierFlags: NSEvent.ModifierFlags? {
             switch self {
             case .shiftMiddleClick:
@@ -82,13 +82,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 return nil
             }
         }
+
+        var usesHoldBehavior: Bool {
+            return self == .middleClickHold
+        }
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Load user preferences
         isDirectionInverted = UserDefaults.standard.bool(forKey: "invertScrollDirection")
         launchAtLogin = UserDefaults.standard.bool(forKey: "launchAtLogin")
-        hideFromMenuBar = UserDefaults.standard.bool(forKey: "hideFromMenuBar")
         scrollSensitivity = UserDefaults.standard.double(forKey: "scrollSensitivity")
         if scrollSensitivity == 0 { scrollSensitivity = 1.0 } // Default if not set
 
@@ -105,7 +108,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         checkAccessibilityPermissions()
 
         setupMenuBar()
-        updateMenuBarVisibility()
         createScrollCursor()
         setupMiddleClickListeners()
         setupTrackpadActivation()
@@ -176,11 +178,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let launchItem = NSMenuItem(title: "Launch at Login", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
         launchItem.state = launchAtLogin ? .on : .off
         menu.addItem(launchItem)
-
-        // Add hide from menu bar toggle
-        let hideItem = NSMenuItem(title: "Hide from Menu Bar", action: #selector(toggleHideFromMenuBar), keyEquivalent: "")
-        hideItem.state = hideFromMenuBar ? .on : .off
-        menu.addItem(hideItem)
 
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "About Scrollapp", action: #selector(showAbout), keyEquivalent: ""))
@@ -428,13 +425,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Restart mouse listeners with new configuration
         setupMiddleClickListeners()
+
+        // Restart click monitor with new behavior
+        if let monitor = clickMonitor {
+            NSEvent.removeMonitor(monitor)
+            clickMonitor = nil
+        }
+        setupClickMonitor()
     }
 
     @objc func showAbout() {
         let alert = NSAlert()
         alert.messageText = "About Scrollapp"
         
-        alert.informativeText = "Scrollapp enables auto-scrolling on macOS.\n\nHow to activate:\n• Middle-click and hold to start scrolling\n• Option + Scroll on trackpad\n• Menu: Use 'Start/Stop Auto-Scroll'\n\nHow to stop:\n• Release the middle-click button\n\nWhile active, move your cursor to control scroll speed and direction.\n\nAdjust scroll speed in the 'Scroll Speed' submenu."
+        alert.informativeText = "Scrollapp enables auto-scrolling on macOS.\n\nHow to activate:\n• Configure your preferred method in 'Activation Method'\n• Option + Scroll on trackpad\n• Menu: Use 'Start/Stop Auto-Scroll'\n\nHow to stop:\n• Middle Click (Hold): Release the button\n• Other methods: Click any mouse button\n\nWhile active, move your cursor to control scroll speed and direction.\n\nAdjust scroll speed in the 'Scroll Speed' submenu."
         alert.alertStyle = .informational
         alert.addButton(withTitle: "OK")
         alert.runModal()
@@ -457,22 +461,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Detect Option key via flagsChanged
         optionKeyMonitor = NSEvent.addGlobalMonitorForEvents(matching: .flagsChanged) { [weak self] event in
             guard let self = self else { return }
-            
+
             // Detect Option key
             let optionKeyFlag = NSEvent.ModifierFlags.option
-            
+
             // If Option key is pressed and we're not already scrolling
             if event.modifierFlags.contains(optionKeyFlag) && !self.isAutoScrolling {
                 // Start a timer to detect if two-finger scroll happens while Option is pressed
                 self.lastScrollTime = Date()
-                
+
                 // If we detect a scroll within 1 second of Option press, activate auto-scroll
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
                     self?.lastScrollTime = nil
                 }
             }
         }
-        
+
         // Detect two-finger scroll while Option is pressed
         scrollMonitor = NSEvent.addGlobalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
             guard let self = self,
@@ -480,18 +484,40 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                   Date().timeIntervalSince(lastScrollTime) < 1.0,
                   !self.isAutoScrolling,
                   abs(event.deltaY) > 0.1 else { return }
-            
+
             // Option + scroll detected, activate auto-scroll
             self.startTrackpadAutoScroll()
         }
-        
-        // Monitor for button releases to exit auto-scroll mode
-        clickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.otherMouseUp]) { [weak self] event in
-            guard let self = self, self.isAutoScrolling else { return }
 
-            // Stop auto-scroll when releasing the activation button
-            if let activationButtonNumber = self.activationMethod.buttonNumber,
-               event.buttonNumber == activationButtonNumber {
+        setupClickMonitor()
+    }
+
+    func setupClickMonitor() {
+        // Monitor for clicks/releases to exit auto-scroll mode
+        if activationMethod.usesHoldBehavior {
+            // Hold behavior: stop on button release
+            clickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.otherMouseUp]) { [weak self] event in
+                guard let self = self, self.isAutoScrolling else { return }
+
+                // Stop auto-scroll when releasing the activation button
+                if let activationButtonNumber = self.activationMethod.buttonNumber,
+                   event.buttonNumber == activationButtonNumber {
+                    self.stopAutoScroll()
+                }
+            }
+        } else {
+            // Original behavior: stop on any click
+            clickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]) { [weak self] event in
+                guard let self = self, self.isAutoScrolling else { return }
+
+                // Don't stop auto-scroll for the configured activation button
+                if event.type == .otherMouseDown,
+                   let activationButtonNumber = self.activationMethod.buttonNumber,
+                   event.buttonNumber == activationButtonNumber {
+                    return // Skip - let the activation method handler deal with it
+                }
+
+                // For all other clicks, stop auto-scroll
                 self.stopAutoScroll()
             }
         }
@@ -521,25 +547,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Update menu item state
         if let launchItem = statusItem.menu?.items.first(where: { $0.title == "Launch at Login" }) {
             launchItem.state = launchAtLogin ? .on : .off
-        }
-    }
-
-    @objc func toggleHideFromMenuBar() {
-        hideFromMenuBar = !hideFromMenuBar
-        UserDefaults.standard.set(hideFromMenuBar, forKey: "hideFromMenuBar")
-        updateMenuBarVisibility()
-
-        // Update menu item state
-        if let hideItem = statusItem.menu?.items.first(where: { $0.title == "Hide from Menu Bar" }) {
-            hideItem.state = hideFromMenuBar ? .on : .off
-        }
-    }
-
-    func updateMenuBarVisibility() {
-        if hideFromMenuBar {
-            statusItem.isVisible = false
-        } else {
-            statusItem.isVisible = true
         }
     }
 
