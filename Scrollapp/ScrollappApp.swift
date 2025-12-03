@@ -119,6 +119,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         setupMenuBar()
         createScrollCursor()
         setupMiddleClickListeners()
+        setupClickMonitor()
         if enableTrackpadActivation {
             setupTrackpadActivation()
         }
